@@ -83,8 +83,8 @@ class Settings:
         if runtime not in ('docker', 'podman'):
             raise ValueError('CLI_BACKUP_CONTAINER_RUNTIME must be docker or podman')
         service = env.get('CLI_BACKUP_DB_SERVICE_NAME', 'mariadb').lower()
-        if service not in ('mariadb', 'mysql', 'sqlite'):
-            raise ValueError('unsupported CLI_BACKUP_DB_SERVICE_NAME; supported: mariadb, mysql, sqlite')
+        if service not in ('mariadb', 'mysql', 'sqlite', 'postgresql'):
+            raise ValueError('unsupported CLI_BACKUP_DB_SERVICE_NAME; supported: mariadb, mysql, sqlite, postgresql')
         if service == 'sqlite':
             if not db_path or not Path(db_path).is_absolute() or container or host or compose:
                 raise ValueError('SQLite requires an absolute CLI_BACKUP_DB_PATH and no container or host')
@@ -97,7 +97,7 @@ class Settings:
                 raise ValueError('invalid CLI_BACKUP_DB_CONTAINER')
             if host and (host.startswith('-') or not re.fullmatch(r'[A-Za-z0-9_.:-]+', host)):
                 raise ValueError('invalid CLI_BACKUP_DB_HOST')
-        port = int(env.get('CLI_BACKUP_DB_PORT', '3306'))
+        port = int(env.get('CLI_BACKUP_DB_PORT', '5432' if service == 'postgresql' else '3306'))
         if not 1 <= port <= 65535:
             raise ValueError('invalid CLI_BACKUP_DB_PORT')
         names = env.get('CLI_BACKUP_DB_NAME', '')
@@ -160,11 +160,33 @@ def container_info(settings: Settings) -> tuple[str, dict[str, str], str]:
     return info[0]['Id'], environment, info[0]['Config']['Image']
 
 
-def connection(settings: Settings) -> tuple[MySQLConfig | None, list[str], str]:
+@dataclass(frozen=True)
+class PostgreSQLConfig:
+    database: str
+    user: str
+    password: str
+    host: str
+    port: int
+    target: str
+    runtime: str
+    cpu_nice: int
+
+
+def connection(settings: Settings) -> tuple[MySQLConfig | PostgreSQLConfig | None, list[str], str]:
     if settings.service == 'sqlite':
         names = databases(settings.names or Path(settings.db_path).stem)
         return None, names, ''
     target, env, image = container_info(settings) if settings.container else ('', {}, '')
+    if settings.service == 'postgresql':
+        names = databases(settings.names or env.get('POSTGRES_DB') or env.get('POSTGRES_USER') or '')
+        user = settings.user or env.get('POSTGRES_USER') or 'postgres'
+        password = settings.password or env.get('POSTGRES_PASSWORD') or ''
+        if not user or user.startswith('-'):
+            raise ValueError('invalid PostgreSQL user')
+        if not password:
+            raise ValueError('database password is missing; set CLI_BACKUP_DB_USER and CLI_BACKUP_DB_PASSWORD')
+        return PostgreSQLConfig(names[0], user, password, settings.host or '127.0.0.1',
+                                settings.port, target, settings.container_runtime, settings.cpu_nice), names, image
     names = databases(settings.names or env.get('MARIADB_DATABASE') or env.get('MYSQL_DATABASE') or '')
     user = settings.user or 'root'
     password = settings.password or env.get('MARIADB_ROOT_PASSWORD') or env.get('MYSQL_ROOT_PASSWORD') or ''
@@ -220,7 +242,35 @@ def capture_gzip(config: MySQLConfig, path: Path) -> None:
         raise
 
 
-def capture_source(settings: Settings, cfg: MySQLConfig | None, name: str, artifact: Path, tmp: Path) -> str | None:
+def capture_postgresql(config: PostgreSQLConfig, name: str, path: Path) -> None:
+    prefix = [config.runtime, 'exec', '-i', '-e', 'PGPASSWORD', config.target] if config.target else []
+    nice = ['nice', '-n', str(config.cpu_nice)] if config.target and config.cpu_nice else []
+    command = prefix + nice + ['pg_dump', '--no-password', '--host', config.host,
+                                '--port', str(config.port), '--username', config.user, '--dbname', name]
+    process = subprocess.Popen(command, env=dict(os.environ, PGPASSWORD=config.password),
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    assert process.stdout is not None
+    try:
+        size = 0
+        with gzip.open(path, 'xb') as output:
+            while chunk := process.stdout.read(1024 * 1024):
+                output.write(chunk)
+                size += len(chunk)
+        process.stdout.close()
+        if process.wait() != 0 or not size:
+            raise ValueError('PostgreSQL dump failed or is empty')
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+
+
+def capture_source(settings: Settings, cfg: MySQLConfig | PostgreSQLConfig | None, name: str, artifact: Path, tmp: Path) -> str | None:
+    if settings.service == 'postgresql':
+        if not isinstance(cfg, PostgreSQLConfig):
+            raise ValueError('missing PostgreSQL connection')
+        capture_postgresql(cfg, name, artifact)
+        return None
     if settings.service != 'sqlite':
         if cfg is None:
             raise ValueError('missing database connection')
@@ -508,6 +558,8 @@ def main(argv=None) -> int:
     parser.add_argument('--storage', choices=('local', 's3'), default='local')
     parser.add_argument('--file')
     parser.add_argument('--database')
+    parser.add_argument('--source-project-name')
+    parser.add_argument('--source-database')
     parser.add_argument('--project-env', type=Path)
     for option in ('project-name', 'compose-project-name', 'db-container', 'db-service-name',
                    'db-host', 'db-port', 'db-name', 'db-user', 'db-path', 'local-root', 's3-bucket', 'cpu-nice', 'container-runtime'):
@@ -523,6 +575,11 @@ def main(argv=None) -> int:
             if value is not None:
                 environment['CLI_BACKUP_' + option.upper()] = value
         settings = Settings.from_env(environment)
+        if (args.source_project_name or args.source_database) and args.action != 'restore':
+            raise ValueError('source project and source database are only supported for restore')
+        source_project = validate_project(args.source_project_name) if args.source_project_name else settings.project
+        if args.source_database and len(databases(args.source_database)) != 1:
+            raise ValueError('source database must be a single database name')
         if args.action == 'config-check':
             print(f'Configuration valid for project {settings.project}')
             return 0
@@ -556,9 +613,10 @@ def main(argv=None) -> int:
             chosen = dict(stores(settings, args.period)).get(args.storage)
             if chosen is None:
                 raise ValueError('storage is not configured')
-            items = list_store(chosen, settings.project, settings.service)
-            if args.database:
-                items = [m for m in items if m.artifact.endswith(backup_suffix(settings, args.database))]
+            items = list_store(chosen, source_project, settings.service)
+            source_database = args.source_database or (args.database if source_project == settings.project else None)
+            if source_database:
+                items = [m for m in items if m.artifact.endswith(backup_suffix(settings, source_database))]
             if args.action == 'list':
                 for item in items:
                     print(f'{item.artifact}\t{item.timestamp}\t{item.size}\t{item.sha256}')
@@ -582,15 +640,17 @@ def main(argv=None) -> int:
             if not match:
                 raise ValueError('invalid scheduled backup filename')
             selected = match.group(1)
-            if names and selected not in names:
+            if source_project == settings.project and not args.source_database and names and selected not in names:
                 raise ValueError('selected database is not configured')
+            if args.source_database and selected != args.source_database:
+                raise ValueError('backup database does not match the selected source database')
             artifact = tmp / manifest.artifact
             get(chosen, manifest, artifact)
             if args.action == 'verify':
                 print('SHA-256 verified')
                 return 0
-            if settings.service == 'sqlite':
-                raise ValueError('SQLite restoration is manual; use the verified backup file')
+            if settings.service in ('sqlite', 'postgresql'):
+                raise ValueError(f'{settings.service} restoration is manual; use the verified backup file')
             plain = tmp / 'restore.sql'
             with gzip.open(artifact, 'rb') as source, plain.open('xb') as output:
                 shutil.copyfileobj(source, output, 1024 * 1024)
@@ -605,9 +665,13 @@ def main(argv=None) -> int:
             else:
                 if not args.file:
                     raise ValueError('--file is required for live restore')
-                if not sys.stdin.isatty() or input(f'Restore {selected} in {settings.project}? Type yes: ') != 'yes':
+                target = args.database or (names[0] if len(names) == 1 else selected)
+                if target not in names:
+                    raise ValueError('restore target database is not configured')
+                prompt = f'Restore {source_project}/{selected} into {settings.project}/{target}? Type yes: '
+                if not sys.stdin.isatty() or input(prompt) != 'yes':
                     raise ValueError('restore not confirmed')
-                database = MySQLConfig(**{**vars(cfg), 'database': selected})
+                database = MySQLConfig(**{**vars(cfg), 'database': target})
                 with plain.open('rb') as source:
                     restore_mysql(database, source)
             return 0

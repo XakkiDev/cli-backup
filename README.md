@@ -8,10 +8,10 @@ A Python command-line tool for full database backups and directory archives, sto
 
 | Interface | Sources | Features |
 | --- | --- | --- |
-| `scheduled` and `share.Makefile` | MariaDB, MySQL, SQLite | Date-based daily, weekly and monthly snapshots; Docker or Podman containers, TCP, or SQLite online backup |
+| `scheduled` and `share.Makefile` | MariaDB, MySQL, PostgreSQL, SQLite | Date-based daily, weekly and monthly snapshots; Docker or Podman containers, TCP, or SQLite online backup |
 | Generic commands | MariaDB/MySQL, Redis, directories | Full dumps, Redis RDB snapshots, gzip tar archives and exclusion patterns |
 
-The CLI runs on the host, supports rootless Docker and Podman for scheduled database backups, and does not require a separate backup service in a project's Compose file. Scheduled Compose targets are discovered from container labels. PostgreSQL, MongoDB and incremental backups are not implemented.
+The CLI runs on the host, supports rootless Docker and Podman for scheduled database backups, and does not require a separate backup service in a project's Compose file. Scheduled Compose targets are discovered from container labels. MongoDB and incremental backups are not implemented.
 
 **Protect backup data and credentials.** Backups are not encrypted by this tool. Use private local paths, protected environment files and encrypted transport. Backups are not a substitute for an authorized recovery exercise. This CLI does not create buckets, change lifecycle policies, or schedule jobs.
 
@@ -47,6 +47,8 @@ Set `CLI_BACKUP_PROJECT_NAME` if the storage namespace should differ from the Co
 
 Container mode defaults to root, using `MARIADB_ROOT_PASSWORD` and `MARIADB_DATABASE` from the container; MySQL equivalents are also supported. Set a user and password together to override root. `CLI_BACKUP_DB_NAME` accepts comma-separated database names; each database produces a separate file. Credentials must be supplied in the environment or a protected project file, never as command-line arguments.
 
+For PostgreSQL, set `CLI_BACKUP_DB_SERVICE_NAME=postgresql`. Container mode defaults to `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` from the database container. The container must accept TCP connections on `127.0.0.1:5432` (or the configured port). Host mode requires `pg_dump` and explicit connection settings. Dumps include one database and use PostgreSQL's consistent snapshot; cluster-wide roles and tablespaces are not included. Restore and restore rehearsal are not implemented for PostgreSQL; verify the checksum and perform recovery manually only with authorization.
+
 For SQLite, set `CLI_BACKUP_PROJECT_NAME`, `CLI_BACKUP_DB_SERVICE_NAME=sqlite`, and an absolute `CLI_BACKUP_DB_PATH`. Do not set container, host or Compose variables. The SQLite online backup API includes committed WAL transactions without stopping the writer. Automatic SQLite restoration is not implemented.
 
 ```sh
@@ -57,6 +59,12 @@ make cli-backup@verify path=daily where=local file=2026-01-01.example.sql.gz
 ```
 
 Additional targets `cli-backup@restore-test` and `cli-backup@restore` exist for MariaDB/MySQL. A live restore is destructive, requires an explicit file and interactive confirmation, and must target the correct stopped-writer environment. A restore rehearsal creates a disposable isolated container and should run only with appropriate authorization. For an unavailable source container, set `CLI_BACKUP_TEST_MYSQL_IMAGE` to an appropriate disposable test image before a rehearsal. Use `db=<name>` to filter when needed. Source-independent `list` and `verify` work with a stopped database container.
+
+To restore a backup from another project into this project's selected MariaDB/MySQL database, explicitly specify the source project and database. Stop writers and run interactively only with authorization; the confirmation names both source and destination. The destination database must already exist. This example reads from S3 without a persistent intermediary dump file:
+
+```sh
+make cli-backup@restore where=s3 path=daily file=2026-01-01.production.sql.gz source_project=production source_db=production db=development
+```
 
 ### Storage and schedule
 
