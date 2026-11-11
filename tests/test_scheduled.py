@@ -196,3 +196,128 @@ class ScheduledTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RecoveryAndDestinationsTests(unittest.TestCase):
+    def test_list_and_verify_do_not_contact_stopped_source(self):
+        import contextlib
+        import io
+        import os
+        from cli_backup.scheduled import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / 'input'
+            artifact.write_bytes(b'backup bytes')
+            name = '2026-06-03.one.sql.gz'
+            manifest = make_manifest(artifact, 'project', 'mariadb', name, '2026-06-03T03:00:00+00:00')
+            LocalStorage(root / 'daily').put(artifact, manifest)
+            env = {'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                   'CLI_BACKUP_LOCAL_ROOT': str(root)}
+            with patch.dict(os.environ, env, clear=True), patch('cli_backup.scheduled.connection', side_effect=AssertionError('source accessed')), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(['list']), 0)
+                self.assertEqual(main(['verify', '--file', name]), 0)
+
+    def test_restore_test_uses_explicit_image_and_podman_without_source(self):
+        import contextlib
+        import io
+        import os
+        from cli_backup.scheduled import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / 'input.gz'
+            with gzip.open(artifact, 'wb') as stream:
+                stream.write(b'SELECT 1;')
+            name = '2026-06-03.one.sql.gz'
+            manifest = make_manifest(artifact, 'project', 'mariadb', name, '2026-06-03T03:00:00+00:00', '1 0 0 0 0')
+            LocalStorage(root / 'daily').put(artifact, manifest)
+            env = {'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                   'CLI_BACKUP_LOCAL_ROOT': str(root), 'CLI_BACKUP_TEST_MYSQL_IMAGE': 'mariadb:test',
+                   'CLI_BACKUP_CONTAINER_RUNTIME': 'podman'}
+            with patch.dict(os.environ, env, clear=True), patch('cli_backup.scheduled.container_info', side_effect=AssertionError('source accessed')), patch('cli_backup.scheduled.rehearse_mysql', return_value='1 0 0 0 0') as rehearsal, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(['restore-test', '--file', name]), 0)
+                self.assertEqual(rehearsal.call_args.kwargs['runtime'], 'podman')
+
+    def test_s3_prefix_covers_period_and_state(self):
+        from cli_backup.scheduled import stores, period_start
+        from cli_backup.storage import make_manifest
+        from types import SimpleNamespace
+        from botocore.exceptions import ClientError
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env({'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                'CLI_BACKUP_S3_BUCKET': 'bucket', 'CLI_BACKUP_S3_ENDPOINT': 'https://example.com',
+                'CLI_BACKUP_S3_REGION': 'us-east-1', 'CLI_BACKUP_S3_KEY': 'key', 'CLI_BACKUP_S3_SECRET': 'secret',
+                'CLI_BACKUP_S3_PREFIX': 'tenant/backups'})
+            with patch('boto3.client') as factory:
+                client = factory.return_value
+                client.get_object.side_effect = ClientError({'Error': {'Code': 'NoSuchKey'}}, 'GetObject')
+                for period in ('daily', 'weekly', 'monthly'):
+                    store = dict(stores(settings, period))['s3']
+                    self.assertEqual(store.prefix, 'tenant/backups/' + period)
+                store = dict(stores(settings, 'daily'))['s3']
+                period_start(store, 'project', 'mariadb', 'one', [SimpleNamespace(timestamp='2026-06-03T00:00:00Z')])
+                self.assertEqual(client.put_object.call_args.kwargs['Key'], 'tenant/backups/.state/project/mariadb/.cli-backup-start-one')
+
+    def test_weekly_attempts_other_destinations_on_failure(self):
+        import contextlib
+        import io
+        from cli_backup.scheduled import direct_period_backups
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings.from_env({'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                'CLI_BACKUP_LOCAL_ROOT': tmp, 'CLI_BACKUP_PERIOD_DAILY': 'false',
+                'CLI_BACKUP_PERIOD_WEEKLY': 'true', 'CLI_BACKUP_PERIOD_MONTHLY': 'false'})
+            attempted = []
+            def put(store, artifact, manifest):
+                attempted.append(store)
+                if store == 'local':
+                    raise OSError('failure')
+            def capture(_settings, _cfg, _name, path, _tmp):
+                path.write_bytes(b'dump')
+                return None
+            with patch('cli_backup.scheduled.stores', return_value=[('local', 'local'), ('s3', 's3')]), patch('cli_backup.scheduled.list_store', return_value=[]), patch('cli_backup.scheduled.capture_source', side_effect=capture), patch('cli_backup.scheduled.put_with_recovery', side_effect=put), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    direct_period_backups(settings, None, 'one', root, datetime.fromisoformat('2026-06-03T03:00:00+00:00'))
+            self.assertEqual(attempted, ['local', 's3'])
+
+    def test_daily_and_weekly_continue_when_other_storage_listing_fails(self):
+        import contextlib
+        import io
+        from cli_backup.scheduled import direct_period_backups
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for direct in (False, True):
+                settings = Settings.from_env({'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                    'CLI_BACKUP_LOCAL_ROOT': tmp, 'CLI_BACKUP_PERIOD_DAILY': str(not direct).lower(),
+                    'CLI_BACKUP_PERIOD_WEEKLY': str(direct).lower(), 'CLI_BACKUP_PERIOD_MONTHLY': 'false'})
+                writes = []
+                def listing(store, *_):
+                    if store == 's3':
+                        raise OSError('unavailable')
+                    return []
+                def capture(_settings, _cfg, _name, path, _tmp):
+                    path.write_bytes(b'dump')
+                    return None
+                with patch('cli_backup.scheduled.stores', return_value=[('s3', 's3'), ('local', 'local')]), patch('cli_backup.scheduled.list_store', side_effect=listing), patch('cli_backup.scheduled.capture_source', side_effect=capture), patch('cli_backup.scheduled.put_with_recovery', side_effect=lambda store, *_: writes.append(store)), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, 'incomplete'):
+                        (direct_period_backups if direct else backup_database)(settings, None, 'one', root, datetime.fromisoformat('2026-06-03T03:00:00+00:00'))
+                self.assertEqual(writes, ['local'])
+
+    def test_restore_test_without_file_requires_database_when_source_unknown_and_multiple_exist(self):
+        import contextlib
+        import io
+        import os
+        from cli_backup.scheduled import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ('one', 'two'):
+                artifact = root / (name + '.gz')
+                with gzip.open(artifact, 'wb') as stream:
+                    stream.write(b'SELECT 1;')
+                filename = '2026-06-03.' + name + '.sql.gz'
+                manifest = make_manifest(artifact, 'project', 'mariadb', filename, '2026-06-03T03:00:00+00:00', '1 0 0 0 0')
+                LocalStorage(root / 'daily').put(artifact, manifest)
+            env = {'CLI_BACKUP_PROJECT_NAME': 'project', 'CLI_BACKUP_DB_CONTAINER': 'db',
+                   'CLI_BACKUP_LOCAL_ROOT': str(root), 'CLI_BACKUP_TEST_MYSQL_IMAGE': 'mariadb:test'}
+            with patch.dict(os.environ, env, clear=True), patch('cli_backup.scheduled.rehearse_mysql') as rehearsal, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(main(['restore-test']), 2)
+                self.assertIn('--database is required', errors.getvalue())
+                rehearsal.assert_not_called()

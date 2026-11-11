@@ -9,6 +9,12 @@ description = "Host backup CLI for database snapshots and directory archives"
 requires-python = ">=3.11"
 dependencies = ["boto3==1.43.127"]
 license = "MIT"
+readme = "README.md"
+keywords = ["backup", "mysql", "mariadb", "sqlite", "s3"]
+
+[project.urls]
+Homepage = "https://github.com/XakkiDev/cli-backup"
+Issues = "https://github.com/XakkiDev/cli-backup/issues"
 
 [project.optional-dependencies]
 dev = ["ruff==0.6.9"]

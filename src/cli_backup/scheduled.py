@@ -65,6 +65,7 @@ class Settings:
     cpu_nice: int
     container_runtime: str
     db_path: str
+    s3_prefix: str
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> Settings:
@@ -129,7 +130,8 @@ class Settings:
                    env.get("CLI_BACKUP_S3_REGION", ""), env.get("CLI_BACKUP_S3_KEY", ""),
                    env.get("CLI_BACKUP_S3_SECRET", ""), env.get("CLI_BACKUP_LOCAL_DAYS", ""),
                    env.get("CLI_BACKUP_TEMP_ROOT", ""), env.get("CLI_BACKUP_TEST_MYSQL_IMAGE", ""),
-                   validate_cpu_nice(env.get("CLI_BACKUP_CPU_NICE", "10")), runtime, db_path)
+                   validate_cpu_nice(env.get("CLI_BACKUP_CPU_NICE", "10")), runtime, db_path,
+                   env.get("CLI_BACKUP_S3_PREFIX", "").strip("/"))
 
 
 def container_info(settings: Settings) -> tuple[str, dict[str, str], str]:
@@ -186,7 +188,7 @@ def stores(settings: Settings, period: str) -> list[tuple[str, object]]:
                               aws_access_key_id=settings.s3_key,
                               aws_secret_access_key=settings.s3_secret,
                               config=Config(s3={'addressing_style': 'path'}))
-        result.append(('s3', S3Storage(client, settings.bucket, period)))
+        result.append(('s3', S3Storage(client, settings.bucket, '/'.join(filter(None, (settings.s3_prefix, period))))))
     return result
 
 
@@ -271,7 +273,7 @@ def period_start(store, project: str, source: str, name: str, available) -> date
                 value = path.read_text(encoding='ascii')
     else:
         from botocore.exceptions import ClientError
-        object_key = '/'.join(('.state', project, source, key))
+        object_key = '/'.join(filter(None, (store.prefix.rsplit('/', 1)[0] if '/' in store.prefix else '', '.state', project, source, key)))
         try:
             body = store.client.get_object(Bucket=store.bucket, Key=object_key)['Body']
             try:
@@ -388,13 +390,20 @@ def backup_database(settings: Settings, cfg: MySQLConfig, name: str, tmp: Path, 
     artifact_name = f'{now:%Y-%m-%d}' + backup_suffix(settings, name)
     existing = []
     missing = []
+    failed = []
     for label, store in destinations:
-        found = next((m for m in list_store(store, settings.project, settings.service)
-                      if m.artifact == artifact_name), None)
-        if found:
-            existing.append((label, store, found))
-        else:
-            missing.append((label, store))
+        try:
+            found = next((m for m in list_store(store, settings.project, settings.service)
+                          if m.artifact == artifact_name), None)
+            if found:
+                existing.append((label, store, found))
+            else:
+                missing.append((label, store))
+        except Exception as exc:
+            print(f'{label}: daily listing failed ({type(exc).__name__})', file=sys.stderr)
+            failed.append(label)
+    if not existing and not missing:
+        raise ValueError('daily backup incomplete')
     artifact = tmp / (name + '.sql.gz')
     if existing:
         manifest = existing[0][2]
@@ -408,7 +417,6 @@ def backup_database(settings: Settings, cfg: MySQLConfig, name: str, tmp: Path, 
     else:
         before = capture_source(settings, cfg, name, artifact, tmp)
         manifest = make_manifest(artifact, settings.project, settings.service, artifact_name, now.isoformat(), before)
-    failed = []
     for label, store in missing:
         try:
             put_with_recovery(store, artifact, manifest)
@@ -431,19 +439,26 @@ def direct_period_backups(settings: Settings, cfg: MySQLConfig, name: str, tmp: 
     week_start = now.date() - timedelta(days=now.weekday())
     new_artifact = None
     new_manifest = None
+    failures = []
     for period in periods:
         destinations = stores(settings, period)
         existing = []
         missing = []
         for label, store in destinations:
-            candidates = [m for m in list_store(store, settings.project, settings.service)
-                          if m.artifact.endswith(backup_suffix(settings, name)) and
-                          (m.timestamp[:7] == now.strftime('%Y-%m') if period == 'monthly'
-                           else week_start <= date.fromisoformat(m.timestamp[:10]) <= now.date())]
-            if candidates:
-                existing.append((label, store, candidates[-1]))
-            else:
-                missing.append((label, store))
+            try:
+                candidates = [m for m in list_store(store, settings.project, settings.service)
+                              if m.artifact.endswith(backup_suffix(settings, name)) and
+                              (m.timestamp[:7] == now.strftime('%Y-%m') if period == 'monthly'
+                               else week_start <= date.fromisoformat(m.timestamp[:10]) <= now.date())]
+                if candidates:
+                    existing.append((label, store, candidates[-1]))
+                else:
+                    missing.append((label, store))
+            except Exception as exc:
+                print(f'{label}: {period} listing failed ({type(exc).__name__})', file=sys.stderr)
+                failures.append((period, label))
+        if not existing and not missing:
+            continue
         if existing:
             manifest = existing[0][2]
             if any(current != manifest for _, _, current in existing):
@@ -461,8 +476,14 @@ def direct_period_backups(settings: Settings, cfg: MySQLConfig, name: str, tmp: 
                                              f'{now:%Y-%m-%d}' + backup_suffix(settings, name), now.isoformat(), before)
             artifact, manifest = new_artifact, new_manifest
         for label, store in missing:
-            put_with_recovery(store, artifact, manifest)
-            print(f'{label}: {period}/{manifest.artifact}')
+            try:
+                put_with_recovery(store, artifact, manifest)
+                print(f'{label}: {period}/{manifest.artifact}')
+            except Exception as exc:
+                print(f'{label}: {period} backup failed ({type(exc).__name__})', file=sys.stderr)
+                failures.append((period, label))
+    if failures:
+        raise ValueError('period backup incomplete')
 
 
 def prune_local_periods(settings: Settings, now: datetime) -> None:
@@ -509,9 +530,12 @@ def main(argv=None) -> int:
             lower_cpu_priority(settings.cpu_nice)
         if args.action in ('verify', 'restore') and not args.file:
             raise ValueError('--file is required')
-        cfg, names, image = connection(settings)
-        if args.database and args.database not in names:
+        cfg, names, image = (connection(settings) if args.action in ('backup', 'restore')
+                             else (None, databases(settings.names) if settings.names else [], ''))
+        if args.database and names and args.database not in names:
             raise ValueError('selected database is not configured')
+        if args.database:
+            databases(args.database)
         with tempfile.TemporaryDirectory(prefix='cli-backup-', dir=settings.temp_root or None) as directory:
             tmp = Path(directory)
             if args.action == 'backup':
@@ -539,13 +563,27 @@ def main(argv=None) -> int:
                 for item in items:
                     print(f'{item.artifact}\t{item.timestamp}\t{item.size}\t{item.sha256}')
                 return 0
-            if len(names) > 1 and not args.database:
-                raise ValueError('--database is required when multiple databases are configured')
-            selected = args.database or names[0]
-            items = [m for m in items if m.artifact.endswith(backup_suffix(settings, selected))]
-            manifest = next((m for m in items if m.artifact == args.file), None) if args.file else (items[-1] if items else None)
+            if args.file:
+                manifest = next((m for m in items if m.artifact == args.file), None)
+            else:
+                if not args.database:
+                    suffix = '.sqlite.gz' if settings.service == 'sqlite' else '.sql.gz'
+                    available_names = {match.group(1) for item in items
+                                       if (match := re.fullmatch(r'\d{4}-\d{2}-\d{2}\.([A-Za-z0-9_][A-Za-z0-9_-]{0,63})' + re.escape(suffix), item.artifact))}
+                    if len(names) > 1 or (not names and len(available_names) > 1):
+                        raise ValueError('--database is required when multiple databases are available')
+                    if len(names) == 1:
+                        items = [item for item in items if item.artifact.endswith(backup_suffix(settings, names[0]))]
+                manifest = items[-1] if items else None
             if manifest is None:
                 raise ValueError('backup not found')
+            suffix = '.sqlite.gz' if settings.service == 'sqlite' else '.sql.gz'
+            match = re.fullmatch(r'\d{4}-\d{2}-\d{2}\.([A-Za-z0-9_][A-Za-z0-9_-]{0,63})' + re.escape(suffix), manifest.artifact)
+            if not match:
+                raise ValueError('invalid scheduled backup filename')
+            selected = match.group(1)
+            if names and selected not in names:
+                raise ValueError('selected database is not configured')
             artifact = tmp / manifest.artifact
             get(chosen, manifest, artifact)
             if args.action == 'verify':
@@ -557,7 +595,10 @@ def main(argv=None) -> int:
             with gzip.open(artifact, 'rb') as source, plain.open('xb') as output:
                 shutil.copyfileobj(source, output, 1024 * 1024)
             if args.action == 'restore-test':
-                restored = rehearse_mysql(plain, settings.test_image or image, settings.service)
+                if not settings.test_image and settings.container:
+                    _, _, image = container_info(settings)
+                restored = rehearse_mysql(plain, settings.test_image or image, settings.service,
+                                         runtime=settings.container_runtime)
                 if restored != manifest.object_counts:
                     raise ValueError('restored object counts do not match manifest')
                 print(f'object counts match: {restored}')

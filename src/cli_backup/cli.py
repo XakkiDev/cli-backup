@@ -35,6 +35,7 @@ def parser_build() -> argparse.ArgumentParser:
                    'redis-port', 'redis-timeout', 'local-days', 'cpu-nice', 'test-mysql-image', 'test-redis-image', 'test-redis-server', 'restore-timeout'):
         parser.add_argument('--' + option)
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('scheduled', help='scheduled database backups; run cli-backup scheduled --help')
     sub.add_parser('config-check')
     publish = sub.add_parser('publish-local')
     publish.add_argument('source', choices=['files', 'mysql', 'redis'])
