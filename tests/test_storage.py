@@ -33,6 +33,37 @@ class StorageTests(unittest.TestCase):
             s3.data['bucket', 'project/mysql/id.bin'] = b'corrupt'
             self.assertFalse(remote.verify(manifest))
 
+    def test_large_s3_reads_retry_a_failed_range_and_verify_checksum(self):
+        from unittest.mock import patch
+        from cli_backup.storage import s3_get
+        class Ranged(FakeS3):
+            def __init__(self):
+                super().__init__()
+                self.failed = False
+            def get_object(self, *, Bucket, Key, Range):
+                start, end = map(int, Range.removeprefix('bytes=').split('-'))
+                if start == 3 and not self.failed:
+                    self.failed = True
+                    raise OSError('transient read failure')
+                data = self.data[Bucket, Key]
+                return {'Body': io.BytesIO(data[start:end + 1]),
+                        'ContentRange': f'bytes {start}-{end}/{len(data)}'}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'data'
+            path.write_bytes(b'abcdefghi')
+            manifest = make_manifest(path, 'project', 'mysql', 'id.bin', '2026-11-10T00:00:00Z')
+            client = Ranged()
+            client.data['bucket', 'project/mysql/id.bin'] = path.read_bytes()
+            store = S3Storage(client, 'bucket')
+            with patch('cli_backup.storage.MULTIPART_THRESHOLD', 2), patch('cli_backup.storage.S3_RANGE_SIZE', 3):
+                output = io.BytesIO()
+                s3_get(store, manifest, output)
+                self.assertEqual(output.getvalue(), b'abcdefghi')
+                self.assertTrue(client.failed)
+                self.assertTrue(store.verify(manifest))
+                client.data['bucket', 'project/mysql/id.bin'] = b'xbcdefghi'
+                self.assertFalse(store.verify(manifest))
+
     def test_incomplete_is_not_listed(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp) / 'project' / 'mysql'

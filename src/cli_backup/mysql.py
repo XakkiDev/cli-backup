@@ -25,20 +25,28 @@ class MySQLConfig:
     compose_dir: str = "."
     client: str = "mariadb"
     compose_env_files: tuple[str, ...] = ()
+    cpu_nice: int = 10
+    container_runtime: str = "docker"
 
     def validate(self) -> None:
+        if type(self.cpu_nice) is not int or not 0 <= self.cpu_nice <= 19:
+            raise ValueError("invalid CPU nice value")
+        if self.container_runtime not in {"docker", "podman"}:
+            raise ValueError("invalid container runtime")
         if self.client not in {"mariadb", "mysql"}:
             raise ValueError("invalid database client")
-        if self.mode not in {"compose", "container", "tcp"}:
+        if self.mode not in {"compose", "container", "tcp", "exec"}:
             raise ValueError("unknown connection mode")
         if not _IDENTIFIER.fullmatch(self.database) or not self.user or self.user.startswith('-'):
             raise ValueError("invalid database or user")
         if not 1 <= self.port <= 65535:
             raise ValueError("invalid port")
-        if self.mode != "compose" and (not self.host or self.host.startswith('-') or not re.fullmatch(r"[A-Za-z0-9_.:-]+", self.host)):
+        if self.mode not in ("compose", "exec") and (not self.host or self.host.startswith('-') or not re.fullmatch(r"[A-Za-z0-9_.:-]+", self.host)):
             raise ValueError("invalid host")
         if self.mode == "compose" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.service):
             raise ValueError("invalid service")
+        if self.mode == "exec" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.service):
+            raise ValueError("invalid container identifier")
         if self.mode == "container" and (not self.network or not self.image or self.network.startswith('-') or self.image.startswith('-')):
             raise ValueError("network and image are required")
 
@@ -47,18 +55,22 @@ def command(config: MySQLConfig, restore: bool = False) -> list[str]:
     config.validate()
     executable = config.client if restore else ("mariadb-dump" if config.client == "mariadb" else "mysqldump")
     if config.mode == "compose":
-        prefix = ["docker", "compose"]
+        prefix = [config.container_runtime, "compose"]
         for env_file in config.compose_env_files:
             if not env_file or env_file.startswith('-'):
                 raise ValueError("invalid Compose env file")
             prefix.extend(["--env-file", env_file])
         prefix.extend(["exec", "-T", "-e", "MYSQL_PWD", config.service])
+    elif config.mode == "exec":
+        prefix = [config.container_runtime, "exec", "-i", "-e", "MYSQL_PWD", config.service]
     elif config.mode == "container":
-        prefix = ["docker", "run", "--rm", "-i", "--network", config.network, "-e", "MYSQL_PWD", config.image]
+        prefix = [config.container_runtime, "run", "--rm", "-i", "--network", config.network, "-e", "MYSQL_PWD", config.image]
     else:
         prefix = []
     args = [executable, "--user", config.user]
-    if config.mode != "compose":
+    if not restore and config.mode in ("exec", "compose", "container") and config.cpu_nice:
+        args = ["nice", "-n", str(config.cpu_nice)] + args
+    if config.mode not in ("compose", "exec"):
         args.extend(["--host", config.host, "--port", str(config.port), "--protocol", "tcp"])
     if not restore:
         args.extend(["--single-transaction", "--routines", "--triggers", "--events", "--hex-blob"])

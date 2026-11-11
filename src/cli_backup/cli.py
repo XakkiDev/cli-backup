@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_config, read_project_env, resolve
+from .cpu_priority import lower_cpu_priority, validate_cpu_nice
 from .files import capture_directory, extract_archive
 from .mysql import MySQLConfig, capture_mysql, count_mysql_objects, restore_mysql
 from .redis_backup import capture_redis
@@ -31,10 +32,13 @@ def parser_build() -> argparse.ArgumentParser:
     parser.add_argument('--compose-env-file', action='append', default=[])
     for option in ('db-mode', 'db-name', 'db-user', 'db-host', 'db-port', 'db-service',
                    'db-network', 'db-image', 'db-client', 'compose-dir', 'redis-host',
-                   'redis-port', 'redis-timeout', 'local-days', 'test-mysql-image', 'test-redis-image', 'test-redis-server', 'restore-timeout'):
+                   'redis-port', 'redis-timeout', 'local-days', 'cpu-nice', 'test-mysql-image', 'test-redis-image', 'test-redis-server', 'restore-timeout'):
         parser.add_argument('--' + option)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('config-check')
+    publish = sub.add_parser('publish-local')
+    publish.add_argument('source', choices=['files', 'mysql', 'redis'])
+    publish.add_argument('--file', required=True)
     backup = sub.add_parser('backup')
     backup.add_argument('source', choices=['files', 'mysql', 'redis'])
     backup.add_argument('--directory', type=Path)
@@ -54,6 +58,10 @@ def parser_build() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == 'scheduled':
+        from .scheduled import main as scheduled_main
+        return scheduled_main(argv[1:])
     args = parser_build().parse_args(argv)
     try:
         project_env = read_project_env(args.project_env) if args.project_env else {}
@@ -61,13 +69,16 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(os.environ, project_env, settings)
         def setting(name: str, default: str = '') -> str:
             return resolve(name, settings.get(name), project_env, os.environ) or default
+        cpu_nice = validate_cpu_nice(setting('cpu_nice', '10'))
+        if args.command == 'backup':
+            lower_cpu_priority(cpu_nice)
         if args.command == 'config-check':
             print(f'Configuration valid for project {config.project}')
             return 0
         stores = {}
         if config.local_root:
             stores['local'] = LocalStorage(Path(config.local_root).expanduser())
-        if config.s3_bucket and (args.command == 'backup' or args.storage == 's3'):
+        if config.s3_bucket and (args.command in ('backup', 'publish-local') or args.storage == 's3'):
             def s3_factory():
                 import boto3
                 from botocore.config import Config
@@ -82,7 +93,21 @@ def main(argv: list[str] | None = None) -> int:
                 user=setting('db_user'), password=setting('db_password'), host=setting('db_host', '127.0.0.1'),
                 port=int(setting('db_port', '3306')), service=setting('db_service', 'mariadb'),
                 network=setting('db_network'), image=setting('db_image'), compose_dir=setting('compose_dir', '.'),
-                client=setting('db_client', 'mariadb'), compose_env_files=tuple(args.compose_env_file))
+                client=setting('db_client', 'mariadb'), compose_env_files=tuple(args.compose_env_file), cpu_nice=cpu_nice)
+        if args.command == 'publish-local':
+            if 'local' not in stores or 's3' not in stores:
+                raise ValueError('local and S3 storage are required')
+            local = stores['local']
+            manifest = next((item for item in local.list(config.project, args.source) if item.artifact == args.file), None)
+            if manifest is None or not local.verify(manifest):
+                raise ValueError('local backup missing or checksum mismatch')
+            remote = stores['s3']()
+            if not remote.verify(manifest):
+                raise ValueError('remote backup checksum mismatch')
+            remote.client.put_object(Bucket=remote.bucket, Key=remote.key(manifest) + '.json',
+                                     Body=manifest.encode(), IfNoneMatch='*')
+            print(f's3: {manifest.artifact}')
+            return 0
         temp_root = setting('temp_root')
         with tempfile.TemporaryDirectory(prefix='cli-backup-', dir=str(Path(temp_root).expanduser().absolute()) if temp_root else None) as tmp:
             artifact = Path(tmp) / 'artifact'
@@ -90,20 +115,25 @@ def main(argv: list[str] | None = None) -> int:
                 retention = setting('local_days')
                 if retention and int(retention) < 1:
                     raise ValueError('local retention days must be positive')
+                object_counts = None
                 if args.source == 'files':
                     if not args.directory:
                         raise ValueError('--directory is required for file backup')
                     capture_directory(args.directory, args.exclude, artifact)
                 elif args.source == 'mysql':
+                    database = mysql_config()
+                    object_counts = count_mysql_objects(database)
                     with artifact.open('xb') as output:
-                        capture_mysql(mysql_config(), output)
+                        capture_mysql(database, output)
+                    if count_mysql_objects(database) != object_counts:
+                        raise ValueError('source schema object counts changed during dump')
                 else:
                     capture_redis(artifact, setting('redis_host', '127.0.0.1'), int(setting('redis_port', '6379')), setting('redis_password') or None, timeout=int(setting('redis_timeout', '14400')))
                 if artifact.stat().st_size == 0:
                     raise ValueError('source produced an empty backup')
                 now = datetime.now(timezone.utc)
                 name = f'{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}.bin'
-                manifest = make_manifest(artifact, config.project, args.source, name, now.isoformat())
+                manifest = make_manifest(artifact, config.project, args.source, name, now.isoformat(), object_counts)
                 failures = []
                 for label, store in stores.items():
                     try:
@@ -143,9 +173,9 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == 'restore-test':
                 if args.source == 'mysql':
                     restored = rehearse_mysql(artifact, setting('test_mysql_image'), setting('db_client', 'mariadb'), int(setting('restore_timeout', '14400')))
-                    live = count_mysql_objects(mysql_config())
-                    if live != restored:
-                        raise ValueError(f'object counts differ: live={live}, restored={restored}')
+                    expected = manifest.object_counts or count_mysql_objects(mysql_config())
+                    if expected != restored:
+                        raise ValueError(f'object counts differ: expected={expected}, restored={restored}')
                     print(f'object counts match: {restored}')
                 elif args.source == 'redis':
                     rehearse_redis(artifact, setting('test_redis_image'), setting('test_redis_server', 'redis-server'))

@@ -19,6 +19,7 @@ from .config import validate_project
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 MULTIPART_THRESHOLD = 5 * 1024**3
 MULTIPART_PART_SIZE = 64 * 1024**2
+S3_RANGE_SIZE = 64 * 1024**2
 
 
 def valid_name(value: str) -> str:
@@ -45,6 +46,7 @@ class Manifest:
     timestamp: str
     size: int
     sha256: str
+    object_counts: str | None = None
 
     def validate(self) -> None:
         if type(self.version) is not int or self.version != 1:
@@ -54,6 +56,8 @@ class Manifest:
         valid_name(self.artifact)
         if type(self.size) is not int or self.size < 0 or not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
             raise ValueError("invalid manifest checksum or size")
+        if self.object_counts is not None and (not isinstance(self.object_counts, str) or not re.fullmatch(r'\d+(?:\s+\d+){4}', self.object_counts)):
+            raise ValueError("invalid object counts")
         if not isinstance(self.timestamp, str):
             raise ValueError("invalid manifest timestamp")
         try:
@@ -79,10 +83,10 @@ class Manifest:
             raise ValueError("invalid manifest") from exc
 
 
-def make_manifest(path: Path, project: str, source: str, name: str, timestamp: str) -> Manifest:
+def make_manifest(path: Path, project: str, source: str, name: str, timestamp: str, object_counts: str | None = None) -> Manifest:
     with path.open("rb") as stream:
         sha, size = digest(stream)
-    result = Manifest(1, project, source, name, timestamp, size, sha)
+    result = Manifest(1, project, source, name, timestamp, size, sha, object_counts)
     result.validate()
     return result
 
@@ -186,6 +190,12 @@ class S3Storage:
             raise
 
     def verify(self, manifest: Manifest) -> bool:
+        if manifest.size > MULTIPART_THRESHOLD:
+            try:
+                s3_get_ranges(self, manifest)
+                return True
+            except ValueError:
+                return False
         stream = self.client.get_object(Bucket=self.bucket, Key=self.key(manifest))["Body"]
         try:
             return digest(stream) == (manifest.sha256, manifest.size)
@@ -242,7 +252,38 @@ def s3_list(store: S3Storage, project: str, source: str) -> list[Manifest]:
     return sorted(found, key=lambda m: datetime.fromisoformat(m.timestamp.replace('Z', '+00:00')))
 
 
+def s3_get_ranges(store: S3Storage, manifest: Manifest, target: BinaryIO | None = None) -> None:
+    """Read bounded ranges; retry a failed range without publishing partial bytes."""
+    manifest.validate()
+    checksum = hashlib.sha256()
+    for offset in range(0, manifest.size, S3_RANGE_SIZE):
+        end = min(offset + S3_RANGE_SIZE, manifest.size) - 1
+        for attempt in range(3):
+            try:
+                response = store.client.get_object(Bucket=store.bucket, Key=store.key(manifest),
+                                                   Range=f'bytes={offset}-{end}')
+                stream = response['Body']
+                try:
+                    data = stream.read(end - offset + 2)
+                finally:
+                    stream.close()
+                if response.get('ContentRange') != f'bytes {offset}-{end}/{manifest.size}' or len(data) != end - offset + 1:
+                    raise ValueError('invalid S3 range response')
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+        checksum.update(data)
+        if target is not None:
+            target.write(data)
+    if checksum.hexdigest() != manifest.sha256:
+        raise ValueError('artifact checksum mismatch')
+
+
 def s3_get(store: S3Storage, manifest: Manifest, target: BinaryIO) -> None:
+    if manifest.size > MULTIPART_THRESHOLD:
+        s3_get_ranges(store, manifest, target)
+        return
     stream = store.client.get_object(Bucket=store.bucket, Key=store.key(manifest))["Body"]
     try:
         copy_verified(stream, target, manifest)

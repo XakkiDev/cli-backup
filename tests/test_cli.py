@@ -18,6 +18,25 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(main(['--project-env', str(path), '--project', 'argument', 'config-check']), 0)
             self.assertIn('argument', output.getvalue())
 
+    def test_publish_local_checks_both_copies_before_manifest(self):
+        from cli_backup.storage import LocalStorage, make_manifest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'data'
+            source.write_bytes(b'content')
+            manifest = make_manifest(source, 'project', 'mysql', 'id.bin', '2026-11-10T00:00:00Z')
+            LocalStorage(root / 'local').put(source, manifest)
+            env = {'CLI_BACKUP_PROJECT': 'project', 'CLI_BACKUP_LOCAL_ROOT': str(root / 'local'),
+                   'CLI_BACKUP_S3_BUCKET': 'bucket'}
+            with patch.dict('os.environ', env, clear=True), patch('boto3.client'), patch('cli_backup.cli.S3Storage') as s3, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                remote = s3.return_value
+                remote.verify.return_value = False
+                self.assertEqual(main(['publish-local', 'mysql', '--file', 'id.bin']), 2)
+                remote.client.put_object.assert_not_called()
+                remote.verify.return_value = True
+                self.assertEqual(main(['publish-local', 'mysql', '--file', 'id.bin']), 0)
+                self.assertEqual(remote.client.put_object.call_args.kwargs['IfNoneMatch'], '*')
+
     def test_project_file_is_not_executed(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / '.env'
@@ -70,9 +89,29 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {'CLI_BACKUP_PROJECT': 'project', 'CLI_BACKUP_LOCAL_ROOT': tmp,
                    'CLI_BACKUP_DB_NAME': 'fixture', 'CLI_BACKUP_DB_USER': 'user'}
-            with patch.dict('os.environ', env, clear=True), patch('cli_backup.cli.capture_mysql'), contextlib.redirect_stderr(io.StringIO()):
+            with patch.dict('os.environ', env, clear=True), patch('cli_backup.cli.capture_mysql'), patch('cli_backup.cli.count_mysql_objects', return_value='1\t0\t0\t0\t0'), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(main(['backup', 'mysql']), 2)
             self.assertFalse((Path(tmp) / 'project').exists())
+
+    def test_mysql_rehearsal_uses_saved_counts_and_rejects_schema_change_during_dump(self):
+        import re
+        from cli_backup.storage import LocalStorage
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {'CLI_BACKUP_PROJECT': 'project', 'CLI_BACKUP_LOCAL_ROOT': tmp,
+                   'CLI_BACKUP_DB_NAME': 'fixture', 'CLI_BACKUP_DB_USER': 'user',
+                   'CLI_BACKUP_TEST_MYSQL_IMAGE': 'fixture/image'}
+            out = io.StringIO()
+            def capture(_config, output):
+                output.write(b'fixture dump')
+            with patch.dict('os.environ', env, clear=True), patch('cli_backup.cli.capture_mysql', side_effect=capture), patch('cli_backup.cli.count_mysql_objects', side_effect=['1\t0\t0\t0\t0', '1\t0\t0\t0\t0']), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(['backup', 'mysql']), 0)
+            name = re.search(r'local: (\S+)', out.getvalue()).group(1)
+            self.assertEqual(LocalStorage(Path(tmp)).list('project', 'mysql')[0].object_counts, '1\t0\t0\t0\t0')
+            with patch.dict('os.environ', env, clear=True), patch('cli_backup.cli.rehearse_mysql', return_value='1\t0\t0\t0\t0'), patch('cli_backup.cli.count_mysql_objects', side_effect=AssertionError('must not query changed live schema')), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(['restore-test', 'mysql', '--file', name]), 0)
+            with patch.dict('os.environ', env, clear=True), patch('cli_backup.cli.capture_mysql', side_effect=capture), patch('cli_backup.cli.count_mysql_objects', side_effect=['1\t0\t0\t0\t0', '2\t0\t0\t0\t0']), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(['backup', 'mysql']), 2)
+            self.assertEqual(len(LocalStorage(Path(tmp)).list('project', 'mysql')), 1)
 
     def test_failed_required_s3_does_not_prune_local_backups(self):
         from cli_backup.storage import LocalStorage, make_manifest

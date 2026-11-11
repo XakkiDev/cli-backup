@@ -14,6 +14,9 @@ class RehearsalTests(unittest.TestCase):
                 run.return_value.stdout = '1\t0\t0\t0\t0\n'
                 self.assertEqual(rehearse_mysql(artifact, 'test/image:1'), '1\t0\t0\t0\t0')
             calls = [args.args[0] for args in run.call_args_list]
+            self.assertIn('--rm', calls[0])
+            self.assertEqual(calls[0][calls[0].index('--cpus') + 1], '2')
+            self.assertEqual(calls[0][calls[0].index('--memory') + 1], '3g')
             self.assertIn('--network', calls[0])
             self.assertEqual(calls[0][calls[0].index('--network') + 1], 'none')
             self.assertEqual(calls[-1][:4], ['docker', 'rm', '-f', '-v'])

@@ -34,7 +34,8 @@ def rehearse_mysql(artifact: Path, image: str, client: str = 'mariadb', import_t
     env = dict(os.environ, MYSQL_ROOT_PASSWORD=password, MYSQL_DATABASE='backup_rehearsal', MYSQL_PWD=password)
     started = False
     try:
-        run(['docker', 'create', '--name', name, '--network', 'none',
+        run(['docker', 'create', '--rm', '--cpus', os.environ.get('CLI_BACKUP_TEST_CPUS', '2'),
+             '--memory', os.environ.get('CLI_BACKUP_TEST_MEMORY', '3g'), '--name', name, '--network', 'none',
              '-e', 'MYSQL_ROOT_PASSWORD', '-e', 'MYSQL_DATABASE', image], env=env, stdout=subprocess.DEVNULL)
         started = True
         run(['docker', 'start', name], env=env, stdout=subprocess.DEVNULL)
@@ -63,7 +64,8 @@ def rehearse_redis(artifact: Path, image: str, server: str = 'redis-server') -> 
     info = subprocess.run(['docker', 'info', '--format', '{{json .SecurityOptions}}'], check=True, capture_output=True, text=True, timeout=30).stdout
     user = '0:0' if 'name=rootless' in info else f'{os.getuid()}:{os.getgid()}'
     try:
-        run(['docker', 'create', '--name', name, '--network', 'none',
+        run(['docker', 'create', '--rm', '--cpus', os.environ.get('CLI_BACKUP_TEST_CPUS', '2'),
+             '--memory', os.environ.get('CLI_BACKUP_TEST_MEMORY', '3g'), '--name', name, '--network', 'none',
              '--user', user,
              '--mount', f'type=bind,src={artifact.resolve()},dst=/data/dump.rdb,readonly',
              '--entrypoint', server, image, '--dir', '/data', '--dbfilename', 'dump.rdb',
