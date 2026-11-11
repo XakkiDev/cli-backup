@@ -29,6 +29,9 @@ make venv install
 
 For a user-wide executable, `pipx install .` installs from the checkout. `share.Makefile` is supplied in the repository checkout rather than the Python wheel: keep or download a trusted checkout to use the shared Make targets. On systems without `ensurepip`, install the matching Python venv package first.
 
+The Composer package `xakki/cli-backup` distributes the source tree and agent skills for Composer-based projects. Composer does not install Python dependencies or provide a ready-to-run CLI: after `composer require xakki/cli-backup`, install the Python project from `vendor/xakki/cli-backup` with `pip` or `pipx` and include `vendor/xakki/cli-backup/share.Makefile` when needed. The `extra.skills.source` metadata identifies the agent skills for compatible Composer skill managers.
+
+
 ## Scheduled database backups
 
 Include `share.Makefile` from your checkout. For a Compose service:

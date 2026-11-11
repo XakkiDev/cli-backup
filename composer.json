@@ -1,0 +1,17 @@
+{
+    "name": "xakki/cli-backup",
+    "description": "Python backup CLI source and AI agent skills for databases and file archives",
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://github.com/XakkiDev/cli-backup",
+    "keywords": ["backup", "database", "s3", "python", "agent-skills"],
+    "support": {
+        "issues": "https://github.com/XakkiDev/cli-backup/issues",
+        "source": "https://github.com/XakkiDev/cli-backup"
+    },
+    "extra": {
+        "skills": {
+            "source": ".agents/skills"
+        }
+    }
+}
