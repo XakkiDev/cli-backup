@@ -668,6 +668,8 @@ def main(argv=None) -> int:
                 target = args.database or (names[0] if len(names) == 1 else selected)
                 if target not in names:
                     raise ValueError('restore target database is not configured')
+                if target != selected:
+                    raise ValueError('restoring to a different database name is not supported safely')
                 prompt = f'Restore {source_project}/{selected} into {settings.project}/{target}? Type yes: '
                 if not sys.stdin.isatty() or input(prompt) != 'yes':
                     raise ValueError('restore not confirmed')

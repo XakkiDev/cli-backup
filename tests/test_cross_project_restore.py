@@ -20,7 +20,7 @@ class CrossProjectRestoreTests(unittest.TestCase):
             artifact = root / 'dump.gz'
             with gzip.open(artifact, 'wb') as stream:
                 stream.write(b'SELECT 1;')
-            filename = '2026-11-11.student.sql.gz'
+            filename = '2026-11-11.student_dev.sql.gz'
             store.put(artifact, make_manifest(artifact, 'sa-prod', 'mariadb', filename, '2026-11-11T00:00:00+00:00'))
             cfg = MySQLConfig('exec', 'student_dev', 'root', 'secret', service='container')
             env = {'CLI_BACKUP_PROJECT_NAME': 'sa-dev', 'CLI_BACKUP_DB_CONTAINER': 'mariadb',
@@ -29,7 +29,7 @@ class CrossProjectRestoreTests(unittest.TestCase):
             def fake_restore(database, stream):
                 captured.append((database.database, stream.read()))
             args = ['restore', '--storage', 's3', '--file', filename,
-                    '--source-project-name', 'sa-prod', '--source-database', 'student']
+                    '--source-project-name', 'sa-prod', '--source-database', 'student_dev']
             with patch.dict(os.environ, env, clear=True), \
                  patch('cli_backup.scheduled.connection', return_value=(cfg, ['student_dev'], 'image')), \
                  patch('cli_backup.scheduled.stores', return_value=[('s3', store)]), \
@@ -37,13 +37,27 @@ class CrossProjectRestoreTests(unittest.TestCase):
                  patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='yes') as prompt:
                 self.assertEqual(main(args), 0)
             self.assertEqual(captured, [('student_dev', b'SELECT 1;')])
-            self.assertIn('sa-prod/student into sa-dev/student_dev', prompt.call_args.args[0])
+            self.assertIn('sa-prod/student_dev into sa-dev/student_dev', prompt.call_args.args[0])
+
+    def test_different_database_name_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); store = LocalStorage(root / 'daily'); artifact = root / 'dump.gz'
+            with gzip.open(artifact, 'wb') as stream: stream.write(b'ALTER DATABASE `student` CHARACTER SET utf8;')
+            filename = '2026-11-11.student.sql.gz'
+            store.put(artifact, make_manifest(artifact, 'sa-prod', 'mariadb', filename, '2026-11-11T00:00:00+00:00'))
+            cfg = MySQLConfig('exec', 'student_dev', 'root', 'secret', service='container')
+            env = {'CLI_BACKUP_PROJECT_NAME': 'sa-dev', 'CLI_BACKUP_DB_CONTAINER': 'mariadb', 'CLI_BACKUP_LOCAL_ROOT': str(root)}
+            with patch.dict(os.environ, env, clear=True), patch('cli_backup.scheduled.connection', return_value=(cfg, ['student_dev'], 'image')), \
+                 patch('cli_backup.scheduled.stores', return_value=[('s3', store)]), patch('cli_backup.scheduled.restore_mysql') as restore, \
+                 patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='yes'), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(['restore', '--storage', 's3', '--file', filename, '--source-project-name', 'sa-prod']), 2)
+                restore.assert_not_called()
 
     def test_confirmation_is_required_even_for_cross_project_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); store = LocalStorage(root / 'daily'); artifact = root / 'dump.gz'
             with gzip.open(artifact, 'wb') as stream: stream.write(b'SELECT 1;')
-            filename = '2026-11-11.student.sql.gz'
+            filename = '2026-11-11.student_dev.sql.gz'
             store.put(artifact, make_manifest(artifact, 'sa-prod', 'mariadb', filename, '2026-11-11T00:00:00+00:00'))
             cfg = MySQLConfig('exec', 'student_dev', 'root', 'secret', service='container')
             env = {'CLI_BACKUP_PROJECT_NAME': 'sa-dev', 'CLI_BACKUP_DB_CONTAINER': 'mariadb', 'CLI_BACKUP_LOCAL_ROOT': str(root)}

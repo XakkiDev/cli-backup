@@ -60,10 +60,10 @@ make cli-backup@verify path=daily where=local file=2026-01-01.example.sql.gz
 
 Additional targets `cli-backup@restore-test` and `cli-backup@restore` exist for MariaDB/MySQL. A live restore is destructive, requires an explicit file and interactive confirmation, and must target the correct stopped-writer environment. A restore rehearsal creates a disposable isolated container and should run only with appropriate authorization. For an unavailable source container, set `CLI_BACKUP_TEST_MYSQL_IMAGE` to an appropriate disposable test image before a rehearsal. Use `db=<name>` to filter when needed. Source-independent `list` and `verify` work with a stopped database container.
 
-To restore a backup from another project into this project's selected MariaDB/MySQL database, explicitly specify the source project and database. Stop writers and run interactively only with authorization; the confirmation names both source and destination. The destination database must already exist. This example reads from S3 without a persistent intermediary dump file:
+To restore a backup from another project into this project's selected MariaDB/MySQL database, explicitly specify the source project and database. Source and destination database names must match: SQL dumps can contain database-qualified statements. Stop writers and run interactively only with authorization; the confirmation names both projects and the database. The destination database must already exist. This example reads from S3 without a persistent intermediary dump file:
 
 ```sh
-make cli-backup@restore where=s3 path=daily file=2026-01-01.production.sql.gz source_project=production source_db=production db=development
+make cli-backup@restore where=s3 path=daily file=2026-01-01.app.sql.gz source_project=production source_db=app db=app
 ```
 
 ### Storage and schedule
